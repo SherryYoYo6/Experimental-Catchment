@@ -1,0 +1,46 @@
+--- --- ---
+PART 1 OF THE DATABASE
+--- --- ---
+
+Approach:
+E: Experimental approach
+M: Modelling approach
+E+M: Combined experimental and modelling approach
+	
+Tracers:
+EC: Electrical conductivity
+		
+Flow type
+S: Surface
+SS: Subsurface
+S+SS: Both surface and subsurface
+		
+Main landscape element:
+H: Hillslope-scale
+C: Catchment-scale
+H+C: Both hillslope- and catchment-scale
+
+
+--- --- --- 
+PART 2 OF THE DATABASE
+--- --- ---
+
+Climate class:
+A: Tropical
+B: Arid
+C: Temperate
+D: Continental
+
+Forest type:
+0: natural
+1:planted or partially planted
+2: not specified
+
+SEOF: Saturation-excess overland flow
+IEOF: Infiltration-excess overland flow
+ET: Evapotranspiration
+Ksat: Hydraulic conductivity
+TWI: Topographic Wetness Index
+SWE: Snow Water Equivalent
+LAI: Leaf Area Index
+
