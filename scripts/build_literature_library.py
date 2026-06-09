@@ -58,19 +58,76 @@ class DownloadLogEntry:
     notes: str = ""
 
 
+GITKEEP = ".gitkeep"
+
+
+def _slug_part(text: str) -> str:
+    text = re.sub(r"\b(experimental|catchment|watershed|basin|river|united states)\b", "", text, flags=re.I)
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"\s+", "_", text.strip())
+    return re.sub(r"_+", "_", text).strip("_")
+
+
 def sanitize_folder_name(watershed: str) -> str:
-    """Short filesystem-safe watershed folder name."""
+    """Short filesystem-safe watershed folder name (single watershed; may collide)."""
     name = watershed.strip()
     if " - " in name:
         parts = [p.strip() for p in name.split(" - ")]
         if len(parts[-1]) < 40:
             name = parts[-1]
-    name = name.split(",")[0].strip()
-    name = re.sub(r"\b(experimental|catchment|watershed|basin|river|united states)\b", "", name, flags=re.I)
-    name = re.sub(r"[^\w\s-]", "", name)
-    name = re.sub(r"\s+", "_", name.strip())
-    name = re.sub(r"_+", "_", name).strip("_")
-    return name[:60] or "Unknown_Watershed"
+    comma_parts = [p.strip() for p in name.split(",")]
+    slug = _slug_part(comma_parts[0]) if comma_parts else ""
+    if len(slug) <= 8 and len(comma_parts) > 1:
+        extra = _slug_part(comma_parts[1])
+        if extra:
+            slug = f"{slug}_{extra}" if slug else extra
+    slug = slug[:60]
+    return slug or "Unknown_Watershed"
+
+
+def _folder_name_candidates(watershed: str) -> list[str]:
+    """Progressively more specific folder names for collision resolution."""
+    name = watershed.strip()
+    if " - " in name:
+        dash_parts = [p.strip() for p in name.split(" - ")]
+        if len(dash_parts[-1]) < 40:
+            name = dash_parts[-1]
+    parts = [p.strip() for p in name.split(",") if p.strip()]
+    candidates: list[str] = []
+    if parts:
+        candidates.append(_slug_part(parts[0]))
+    if len(parts) >= 2:
+        candidates.append(_slug_part(f"{parts[0]}_{parts[1]}"))
+    if len(parts) >= 3:
+        candidates.append(_slug_part(f"{parts[0]}_{parts[1]}_{parts[2]}"))
+    candidates.append(_slug_part(name.replace(",", " ")))
+    seen: list[str] = []
+    for c in candidates:
+        c = (c or "Unknown_Watershed")[:60]
+        if c not in seen:
+            seen.append(c)
+    return seen or ["Unknown_Watershed"]
+
+
+def build_watershed_folder_map(watersheds: list[str]) -> dict[str, str]:
+    """One unique folder name per watershed row (243 folders for 243 rows)."""
+    assigned: dict[str, str] = {}
+    used: set[str] = set()
+    for ws in watersheds:
+        chosen = None
+        for candidate in _folder_name_candidates(ws):
+            if candidate not in used:
+                chosen = candidate
+                break
+        if not chosen:
+            base = _folder_name_candidates(ws)[-1][:50]
+            n = 2
+            while f"{base}_{n}"[:60] in used:
+                n += 1
+            chosen = f"{base}_{n}"[:60]
+        assigned[ws] = chosen
+        used.add(chosen)
+    return assigned
 
 
 def extract_doi(text: str) -> str:
@@ -136,9 +193,9 @@ def dedup_key(paper: Paper) -> str:
     return f"title:{paper.title.lower()[:80]}|{paper.year}|{paper.first_author.lower()}"
 
 
-def collect_papers_for_row(row: pd.Series) -> list[Paper]:
+def collect_papers_for_row(row: pd.Series, folder_map: dict[str, str] | None = None) -> list[Paper]:
     ws = str(row["Watershed"])
-    folder = sanitize_folder_name(ws)
+    folder = (folder_map or {}).get(ws, sanitize_folder_name(ws))
     papers: list[Paper] = []
     m_cits = split_papers(row.get("McMillan_Literature", ""))
     m_urls = split_papers(row.get("McMillan_Literature_URL", ""))
@@ -189,16 +246,26 @@ def collect_papers_for_row(row: pd.Series) -> list[Paper]:
     return unique
 
 
-def ensure_watershed_folder(watershed: str) -> Path:
-    folder = LIBRARY_ROOT / sanitize_folder_name(watershed)
+def ensure_watershed_folder(folder_name: str) -> Path:
+    """Create watershed folder and .gitkeep so empty folders are tracked in git."""
+    folder = LIBRARY_ROOT / folder_name
     folder.mkdir(parents=True, exist_ok=True)
+    gitkeep = folder / GITKEEP
+    if not gitkeep.exists():
+        gitkeep.write_text("", encoding="utf-8")
     return folder
 
 
-def create_all_watershed_folders(df: pd.DataFrame) -> None:
+def create_all_watershed_folders(df: pd.DataFrame, save_mapping: bool = False) -> dict[str, str]:
+    """Create one folder per watershed row (including those with zero PDFs)."""
     LIBRARY_ROOT.mkdir(parents=True, exist_ok=True)
-    for ws in df["Watershed"].dropna().unique():
-        ensure_watershed_folder(str(ws))
+    folder_map = build_watershed_folder_map(df["Watershed"].astype(str).tolist())
+    for folder_name in folder_map.values():
+        ensure_watershed_folder(folder_name)
+    df["PDF_Library_Folder"] = df["Watershed"].astype(str).map(folder_map)
+    if save_mapping:
+        df.to_excel(INPUT_FILE, index=False)
+    return folder_map
 
 
 def search_web_pdf_urls(paper: Paper) -> list[tuple[str, str]]:
@@ -601,13 +668,16 @@ def run_batch(batch_num: int, df: pd.DataFrame | None = None, cumulative: pd.Dat
     batch_df = df.iloc[start:end].copy()
     all_logs: list[DownloadLogEntry] = []
     LIBRARY_ROOT.mkdir(parents=True, exist_ok=True)
+    folder_map = build_watershed_folder_map(df["Watershed"].astype(str).tolist())
+    df["PDF_Library_Folder"] = df["Watershed"].astype(str).map(folder_map)
 
     print(f"Batch {batch_num:02d}: watersheds {start+1}-{min(end, len(df))} ({len(batch_df)} rows)")
 
     with httpx.Client(headers=HEADERS) as client:
         for idx, row in batch_df.iterrows():
-            ensure_watershed_folder(str(row["Watershed"]))
-            papers = collect_papers_for_row(row)
+            ws = str(row["Watershed"])
+            ensure_watershed_folder(folder_map[ws])
+            papers = collect_papers_for_row(row, folder_map)
             print(f"  {row['Watershed'][:50]}: {len(papers)} papers")
             for paper in papers:
                 entry = process_paper(client, paper)
@@ -693,13 +763,17 @@ def main():
     parser.add_argument("--from-batch", type=int, default=None, help="Run batches from N to --to-batch")
     parser.add_argument("--to-batch", type=int, default=None, help="Run batches through M inclusive")
     parser.add_argument("--create-folders-only", action="store_true", help="Create all watershed folders and exit")
+    parser.add_argument("--sync-folders", action="store_true", help="Create all folders + .gitkeep, update PDF_Library_Folder")
     args = parser.parse_args()
 
     df = pd.read_excel(INPUT_FILE)
-    create_all_watershed_folders(df)
-    if args.create_folders_only:
-        print(f"Created {len(list(LIBRARY_ROOT.iterdir()))} watershed folders under {LIBRARY_ROOT}")
+    if args.sync_folders or args.create_folders_only:
+        folder_map = create_all_watershed_folders(df, save_mapping=True)
+        n_folders = len(set(folder_map.values()))
+        print(f"Created/verified {n_folders} watershed folders under {LIBRARY_ROOT} (one per row)")
         return
+
+    create_all_watershed_folders(df, save_mapping=False)
 
     if args.from_batch and args.to_batch:
         cumulative = load_cumulative_log()
