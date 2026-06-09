@@ -8,8 +8,6 @@ Processes 20 watersheds per batch (use --batch N).
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -25,6 +23,7 @@ from rapidfuzz import fuzz
 WORKSPACE = Path("/workspace")
 INPUT_FILE = WORKSPACE / "Literature.xlsx"
 LIBRARY_ROOT = WORKSPACE / "Runoff_Mechanism_Library"
+CUMULATIVE_LOG = WORKSPACE / "PDF_Download_Log_cumulative.xlsx"
 BATCH_SIZE = 20
 ACCESS_DATE = date.today().isoformat()
 EMAIL = "literature@github.com"
@@ -171,9 +170,117 @@ def collect_papers_for_row(row: pd.Series) -> list[Paper]:
     for p in papers:
         if p.dedup_key in seen:
             continue
+        # citation similarity dedup
+        dup = False
+        for u in unique:
+            if p.doi and u.doi and p.doi.lower() == u.doi.lower():
+                dup = True
+                break
+            if p.title and u.title and fuzz.ratio(p.title.lower(), u.title.lower()) > 92:
+                dup = True
+                break
+            if fuzz.ratio(p.citation[:120], u.citation[:120]) > 95:
+                dup = True
+                break
+        if dup:
+            continue
         seen.add(p.dedup_key)
         unique.append(p)
     return unique
+
+
+def ensure_watershed_folder(watershed: str) -> Path:
+    folder = LIBRARY_ROOT / sanitize_folder_name(watershed)
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def create_all_watershed_folders(df: pd.DataFrame) -> None:
+    LIBRARY_ROOT.mkdir(parents=True, exist_ok=True)
+    for ws in df["Watershed"].dropna().unique():
+        ensure_watershed_folder(str(ws))
+
+
+def search_web_pdf_urls(paper: Paper) -> list[tuple[str, str]]:
+    """Mandatory supplemental web search via DuckDuckGo for legal PDF hosts."""
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            return []
+    queries = []
+    if paper.doi:
+        queries.append(f"{paper.doi} pdf")
+    if paper.title and paper.year:
+        queries.append(
+            f'"{paper.first_author}" {paper.year} {paper.title[:70]} pdf site:zenodo.org OR site:osf.io OR site:hydroshare.org'
+        )
+        queries.append(
+            f'"{paper.title[:60]}" {paper.year} pdf repository'
+        )
+    allowed_hosts = (
+        "zenodo.org", "osf.io", "hydroshare.org", "edu", "gov", "arxiv.org",
+        "copernicus.org", "frontiersin.org", "mdpi.com", "usgs.gov", "usda.gov",
+        "fs.fed.us", "lter", "digitalcommons", "repository", "hal.", "ssrn.com",
+    )
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    ddgs = DDGS()
+    for q in queries[:3]:
+        try:
+            for r in ddgs.text(q, max_results=6):
+                url = r.get("href", "")
+                if not url or url in seen:
+                    continue
+                ul = url.lower()
+                if ".pdf" in ul or any(h in ul for h in allowed_hosts):
+                    if any(b in ul for b in ("sci-hub", "libgen", "z-lib")):
+                        continue
+                    seen.add(url)
+                    out.append((url, "WebSearch"))
+        except Exception:
+            pass
+        time.sleep(1.0)
+    return out
+
+
+def crossref_pdf_link(client: httpx.Client, doi: str) -> str | None:
+    try:
+        r = client.get(
+            f"https://api.crossref.org/works/{doi}",
+            headers={**HEADERS, "mailto": EMAIL},
+            timeout=25,
+        )
+        if r.status_code != 200:
+            return None
+        for link in r.json().get("message", {}).get("link", []):
+            if link.get("content-type") == "application/pdf" and link.get("URL"):
+                return link["URL"]
+    except Exception:
+        pass
+    return None
+
+
+def zenodo_search_pdf(client: httpx.Client, paper: Paper) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    q = paper.doi or f"{paper.title} {paper.year}"
+    try:
+        r = client.get(
+            "https://zenodo.org/api/records",
+            params={"q": q, "size": 3},
+            timeout=25,
+        )
+        if r.status_code == 200:
+            for rec in r.json().get("hits", {}).get("hits", []):
+                for f in rec.get("files", []):
+                    key = f.get("key", "")
+                    if key.lower().endswith(".pdf"):
+                        out.append((f.get("links", {}).get("self", ""), "Zenodo"))
+    except Exception:
+        pass
+    return [(u, s) for u, s in out if u]
 
 
 def copernicus_pdf_url(doi: str) -> str | None:
@@ -285,6 +392,10 @@ def find_oa_urls(client: httpx.Client, paper: Paper) -> list[tuple[str, str]]:
         except Exception:
             pass
 
+        cr = crossref_pdf_link(client, doi)
+        if cr:
+            candidates.append((cr, "Crossref"))
+
         # Scrape DOI landing page for PDF links
         try:
             r = client.get(f"https://doi.org/{doi}", timeout=30, follow_redirects=True)
@@ -297,6 +408,10 @@ def find_oa_urls(client: httpx.Client, paper: Paper) -> list[tuple[str, str]]:
                     candidates.append((pdf, "DOI_landing_pdf"))
         except Exception:
             pass
+
+        candidates.extend(zenodo_search_pdf(client, paper))
+
+    candidates.extend(search_web_pdf_urls(paper))
 
     # dedupe urls
     seen_u: set[str] = set()
@@ -413,13 +528,11 @@ def update_watershed_row(row: pd.Series, papers: list[Paper], logs: list[Downloa
     total = len(ws_logs)
 
     if total == 0:
-        status = "Not_Started"
+        status = "Complete"
     elif missing == 0 and ambiguous == 0:
         status = "Complete"
-    elif downloaded > 0:
-        status = "Partial"
     else:
-        status = "Partial"
+        status = "Incomplete"
 
     missing_cits = []
     for l in ws_logs:
@@ -449,17 +562,28 @@ def update_watershed_row(row: pd.Series, papers: list[Paper], logs: list[Downloa
     }
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch", type=int, default=1, help="Batch number (1-based, 20 watersheds each)")
-    args = parser.parse_args()
+def load_cumulative_log() -> pd.DataFrame:
+    cols = [
+        "Watershed", "Paper_Title", "Authors", "Year", "DOI", "Source_Field",
+        "Download_Result", "PDF_File_Path", "Notes",
+    ]
+    if CUMULATIVE_LOG.exists():
+        return pd.read_excel(CUMULATIVE_LOG)
+    return pd.DataFrame(columns=cols)
 
-    batch_num = args.batch
+
+def save_cumulative_log(log_df: pd.DataFrame) -> None:
+    log_df.to_excel(CUMULATIVE_LOG, index=False)
+
+
+def run_batch(batch_num: int, df: pd.DataFrame | None = None, cumulative: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     start = (batch_num - 1) * BATCH_SIZE
     end = start + BATCH_SIZE
 
-    df = pd.read_excel(INPUT_FILE)
-    batch_df = df.iloc[start:end].copy()
+    if df is None:
+        df = pd.read_excel(INPUT_FILE)
+    if cumulative is None:
+        cumulative = load_cumulative_log()
 
     new_cols = {
         "Downloaded_PDF_Count": 0,
@@ -474,6 +598,7 @@ def main():
     df["Downloaded_PDF_Count"] = pd.to_numeric(df["Downloaded_PDF_Count"], errors="coerce").fillna(0).astype(int)
     df["Missing_PDF_Count"] = pd.to_numeric(df["Missing_PDF_Count"], errors="coerce").fillna(0).astype(int)
 
+    batch_df = df.iloc[start:end].copy()
     all_logs: list[DownloadLogEntry] = []
     LIBRARY_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -481,6 +606,7 @@ def main():
 
     with httpx.Client(headers=HEADERS) as client:
         for idx, row in batch_df.iterrows():
+            ensure_watershed_folder(str(row["Watershed"]))
             papers = collect_papers_for_row(row)
             print(f"  {row['Watershed'][:50]}: {len(papers)} papers")
             for paper in papers:
@@ -522,9 +648,25 @@ def main():
         "notes": "Notes",
     })
 
+    # Merge into cumulative log (replace same watershed+doi entries from this batch)
+    if not cumulative.empty:
+        batch_keys = set(
+            (r["Watershed"], str(r.get("DOI", "")))
+            for _, r in log_df.iterrows()
+        )
+        cumulative = cumulative[
+            ~cumulative.apply(
+                lambda r: (r["Watershed"], str(r.get("DOI", "") if pd.notna(r.get("DOI")) else "")) in batch_keys,
+                axis=1,
+            )
+        ]
+    cumulative = pd.concat([cumulative, log_df], ignore_index=True)
+    save_cumulative_log(cumulative)
+
     with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
         df.to_excel(w, sheet_name="Literature", index=False)
         log_df.to_excel(w, sheet_name="PDF_Download_Log", index=False)
+        cumulative.to_excel(w, sheet_name="PDF_Download_Log_Cumulative", index=False)
 
     # Also update master Literature.xlsx for processed rows only
     master = pd.read_excel(INPUT_FILE)
@@ -542,6 +684,31 @@ def main():
     print(f"PDFs in {LIBRARY_ROOT}")
     downloaded = sum(1 for l in all_logs if l.download_result == "Downloaded")
     print(f"Downloaded: {downloaded}/{len(all_logs)}")
+    return df, cumulative
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch", type=int, default=1, help="Batch number (1-based, 20 watersheds each)")
+    parser.add_argument("--from-batch", type=int, default=None, help="Run batches from N to --to-batch")
+    parser.add_argument("--to-batch", type=int, default=None, help="Run batches through M inclusive")
+    parser.add_argument("--create-folders-only", action="store_true", help="Create all watershed folders and exit")
+    args = parser.parse_args()
+
+    df = pd.read_excel(INPUT_FILE)
+    create_all_watershed_folders(df)
+    if args.create_folders_only:
+        print(f"Created {len(list(LIBRARY_ROOT.iterdir()))} watershed folders under {LIBRARY_ROOT}")
+        return
+
+    if args.from_batch and args.to_batch:
+        cumulative = load_cumulative_log()
+        for b in range(args.from_batch, args.to_batch + 1):
+            print(f"\n{'='*60}\nRunning batch {b}\n{'='*60}")
+            df, cumulative = run_batch(b, df=df, cumulative=cumulative)
+        return
+
+    run_batch(args.batch, df=df)
 
 
 if __name__ == "__main__":
